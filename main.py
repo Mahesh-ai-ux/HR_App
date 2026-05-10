@@ -112,6 +112,18 @@ def list_employees(db: Session = Depends(get_db), me=Depends(auth.get_current_us
     return db.query(models.User).filter(models.User.role == "employee").all()
 
 
+
+@app.put("/api/employees/me/profile", response_model=schemas.EmployeeOut)
+def update_my_profile(data: schemas.SelfProfileUpdate,
+                      db: Session = Depends(get_db),
+                      me=Depends(auth.get_current_user)):
+    """Any logged-in user can update their own name, phone, address."""
+    for k, v in data.model_dump(exclude_unset=True).items():
+        setattr(me, k, v)
+    db.commit()
+    db.refresh(me)
+    return me
+
 @app.get("/api/employees/me", response_model=schemas.EmployeeOut)
 def my_profile(db: Session = Depends(get_db), me=Depends(auth.get_current_user)):
     return me
@@ -129,8 +141,8 @@ def get_employee(emp_id: int, db: Session = Depends(get_db), me=Depends(auth.get
 
 @app.post("/api/employees", response_model=schemas.EmployeeOut)
 def create_employee(data: schemas.EmployeeCreate, db: Session = Depends(get_db), me=Depends(auth.get_current_user)):
-    if me.role != "hr_admin":
-        raise HTTPException(403, "Only HR Admin can add employees")
+    if me.role not in ["hr_admin", "ceo"]:
+        raise HTTPException(403, "Only HR Admin or CEO can add employees")
     if db.query(models.User).filter(models.User.email == data.email).first():
         raise HTTPException(400, "Email already registered")
     if db.query(models.User).filter(models.User.employee_id == data.employee_id).first():
@@ -157,7 +169,7 @@ def create_employee(data: schemas.EmployeeCreate, db: Session = Depends(get_db),
 @app.put("/api/employees/{emp_id}", response_model=schemas.EmployeeOut)
 def update_employee(emp_id: int, data: schemas.EmployeeUpdate,
                     db: Session = Depends(get_db), me=Depends(auth.get_current_user)):
-    if me.role != "hr_admin":
+    if me.role not in ["hr_admin", "ceo"]:
         raise HTTPException(403, "Forbidden")
     emp = db.query(models.User).filter(models.User.id == emp_id).first()
     if not emp:
@@ -187,27 +199,50 @@ async def upload_resume(emp_id: int, file: UploadFile = File(...),
                          db: Session = Depends(get_db), me=Depends(auth.get_current_user)):
     if me.role != "hr_admin":
         raise HTTPException(403, "Forbidden")
-    os.makedirs("uploads/resumes", exist_ok=True)
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    upload_dir = os.path.join(base_dir, "uploads", "resumes")
+    os.makedirs(upload_dir, exist_ok=True)
     filename = f"{emp_id}_{file.filename}"
-    path = f"uploads/resumes/{filename}"
-    content = await file.read()
-    with open(path, "wb") as f:
-        f.write(content)
-    r = models.Resume(user_id=emp_id, filename=filename, file_path=path)
+    rel_path = os.path.join("uploads", "resumes", filename)
+    abs_path = os.path.join(base_dir, rel_path)
+    file_bytes = await file.read()
+    with open(abs_path, "wb") as f:
+        f.write(file_bytes)
+    r = models.Resume(user_id=emp_id, filename=filename, file_path=rel_path)
     db.add(r)
     db.commit()
     return {"message": "Resume uploaded", "filename": filename}
 
 
 @app.get("/api/employees/{emp_id}/resume")
-def download_resume(emp_id: int, db: Session = Depends(get_db), me=Depends(auth.get_current_user)):
+def download_resume(
+    emp_id: int,
+    token: Optional[str] = None,
+    db: Session = Depends(get_db),
+    credentials=Depends(auth.bearer)
+):
+    raw_token = token or (credentials.credentials if credentials else None)
+    if not raw_token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    try:
+        from jose import jwt as _jwt
+        payload = _jwt.decode(raw_token, auth.SECRET_KEY, algorithms=[auth.ALGORITHM])
+        user_id = int(payload.get("sub"))
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    me = db.query(models.User).filter(models.User.id == user_id).first()
+    if not me:
+        raise HTTPException(status_code=401, detail="User not found")
     if me.role not in ["ceo", "hr_admin"] and me.id != emp_id:
-        raise HTTPException(403)
+        raise HTTPException(403, "Forbidden")
     r = db.query(models.Resume).filter(models.Resume.user_id == emp_id).order_by(models.Resume.id.desc()).first()
     if not r:
         raise HTTPException(404, "No resume found")
-    return FileResponse(r.file_path, filename=r.filename,
-                        media_type="application/octet-stream")
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    abs_path = os.path.join(base_dir, r.file_path)
+    if not os.path.exists(abs_path):
+        raise HTTPException(404, "Resume file not found on disk")
+    return FileResponse(abs_path, filename=r.filename, media_type="application/octet-stream")
 
 
 @app.get("/api/employees/{emp_id}/resume/info")
@@ -296,6 +331,7 @@ def list_attendance(emp_id: Optional[int] = None,
 # ══════════════════════════════════════════════════════
 @app.post("/api/leaves")
 def apply_leave(data: schemas.LeaveCreate, db: Session = Depends(get_db), me=Depends(auth.get_current_user)):
+    # All roles (employee, hr_admin, ceo) can apply for leave
     leave = models.Leave(
         user_id=me.id,
         leave_type=data.leave_type,
@@ -336,7 +372,7 @@ def list_leaves(db: Session = Depends(get_db), me=Depends(auth.get_current_user)
 def update_leave(leave_id: int, data: schemas.LeaveUpdate,
                   db: Session = Depends(get_db), me=Depends(auth.get_current_user)):
     if me.role not in ["hr_admin", "ceo"]:
-        raise HTTPException(403)
+        raise HTTPException(403, "Only HR Admin or CEO can approve leaves")
     leave = db.query(models.Leave).filter(models.Leave.id == leave_id).first()
     if not leave:
         raise HTTPException(404)
@@ -408,16 +444,85 @@ def list_payslips(db: Session = Depends(get_db), me=Depends(auth.get_current_use
 
 
 @app.get("/api/payslips/{payslip_id}/download")
-def download_payslip(payslip_id: int, db: Session = Depends(get_db), me=Depends(auth.get_current_user)):
+def download_payslip(
+    payslip_id: int,
+    token: Optional[str] = None,
+    db: Session = Depends(get_db),
+    credentials=Depends(auth.bearer)
+):
+    # Accept token from query param (for browser <a href> links) OR Authorization header
+    raw_token = token or (credentials.credentials if credentials else None)
+    if not raw_token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    try:
+        from jose import jwt as _jwt
+        payload = _jwt.decode(raw_token, auth.SECRET_KEY, algorithms=[auth.ALGORITHM])
+        user_id = int(payload.get("sub"))
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    me = db.query(models.User).filter(models.User.id == user_id).first()
+    if not me:
+        raise HTTPException(status_code=401, detail="User not found")
+
     ps = db.query(models.Payslip).filter(models.Payslip.id == payslip_id).first()
     if not ps:
-        raise HTTPException(404)
+        raise HTTPException(404, "Payslip not found")
     if me.role == "employee" and ps.user_id != me.id:
-        raise HTTPException(403)
+        raise HTTPException(403, "Forbidden")
+
+    # Resolve absolute path so it works in Docker and locally
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    abs_path = os.path.join(base_dir, ps.pdf_path)
+    if not os.path.exists(abs_path):
+        raise HTTPException(404, "PDF file not found. Please regenerate the payslip.")
+
     months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
     fname = f"Payslip_{months[ps.month-1]}_{ps.year}.pdf"
-    return FileResponse(ps.pdf_path, media_type="application/pdf", filename=fname)
+    return FileResponse(abs_path, media_type="application/pdf", filename=fname)
 
+
+
+
+@app.get("/api/payslips/{payslip_id}/view")
+def view_payslip(
+    payslip_id: int,
+    token: Optional[str] = None,
+    db: Session = Depends(get_db),
+    credentials=Depends(auth.bearer)
+):
+    """Return payslip PDF inline (for in-browser viewing)."""
+    raw_token = token or (credentials.credentials if credentials else None)
+    if not raw_token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    try:
+        from jose import jwt as _jwt
+        payload = _jwt.decode(raw_token, auth.SECRET_KEY, algorithms=[auth.ALGORITHM])
+        user_id = int(payload.get("sub"))
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    me = db.query(models.User).filter(models.User.id == user_id).first()
+    if not me:
+        raise HTTPException(status_code=401, detail="User not found")
+
+    ps = db.query(models.Payslip).filter(models.Payslip.id == payslip_id).first()
+    if not ps:
+        raise HTTPException(404, "Payslip not found")
+    if me.role == "employee" and ps.user_id != me.id:
+        raise HTTPException(403, "Forbidden")
+
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    abs_path = os.path.join(base_dir, ps.pdf_path)
+    if not os.path.exists(abs_path):
+        raise HTTPException(404, "PDF file not found. Please regenerate the payslip.")
+
+    from fastapi.responses import Response
+    with open(abs_path, "rb") as f:
+        pdf_bytes = f.read()
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": "inline"}
+    )
 
 @app.post("/api/payslips/{payslip_id}/email")
 def email_payslip(payslip_id: int, db: Session = Depends(get_db), me=Depends(auth.get_current_user)):
