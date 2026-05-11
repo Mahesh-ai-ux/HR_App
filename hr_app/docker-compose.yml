@@ -1,0 +1,29 @@
+version: "3.9"
+
+services:
+  nexila-hr:
+    build: .
+    container_name: nexila_hr_app
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - SECRET_KEY=${SECRET_KEY:-nexila_hr_secret_change_me}
+      - SMTP_HOST=${SMTP_HOST:-smtp.gmail.com}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_USER=${SMTP_USER:-}
+      - SMTP_PASS=${SMTP_PASS:-}
+      - DATABASE_URL=sqlite:///./data/nexila_hr.db
+    volumes:
+      - hr_data:/app/data
+      - hr_uploads:/app/uploads
+    networks:
+      - nexila_net
+
+networks:
+  nexila_net:
+    driver: bridge
+
+volumes:
+  hr_data:
+  hr_uploads:
