@@ -25,7 +25,7 @@ app.add_middleware(
 # Geofence — Nexila Technologies, West Tambaram, Chennai
 OFFICE_LAT = 12.9291
 OFFICE_LNG = 80.1003
-GEOFENCE_RADIUS_M = 500  # metres (configurable)
+GEOFENCE_RADIUS_M = 2000  # metres (configurable)
 
 
 # ══════════════════════════════════════════════════════
